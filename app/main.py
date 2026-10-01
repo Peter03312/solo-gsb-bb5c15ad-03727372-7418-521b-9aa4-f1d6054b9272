@@ -42,6 +42,9 @@ from .schemas import (
     ReservationReassignIn,
     ReservationRescheduleIn,
     ReservationStateOut,
+    TripCreateIn,
+    TripOut,
+    TripStopOut,
     VersionOut,
     VersionSummaryOut,
     WaitlistCreateIn,
@@ -846,6 +849,221 @@ def reassign_reservation(
             # transaction, leaving the source reservation and the target
             # point's occupancy untouched.
             return _reassign_out(cancelled, new_reservation, target_rules["version"])
+
+
+# ---------------------------------------------------------------------------
+# Multi-stop trips (跨回收点行程) — one atomic booking across 2..5 points
+# ---------------------------------------------------------------------------
+
+def _with_stop(exc: ApiError, index: int) -> ApiError:
+    """Re-tag a per-stop validation error with the failing stop's position.
+
+    The original error code/message stay intact ("原有错误原因"); the details
+    gain the 0-based stop index so the caller knows which stop failed.
+    """
+    exc.details = {**exc.details, "stop_index": index}
+    return exc
+
+
+def _trip_stop_out(stop: dict) -> TripStopOut:
+    """One stop from a trip_stops join row.
+
+    Window/rules version come from the reservation's immutable creation
+    snapshot (revision always 1); status fields are the live row.
+    """
+    return TripStopOut(
+        index=stop["stop_order"],
+        point_id=stop["point_id"],
+        id=stop["reservation_id"],
+        status=stop["status"],
+        revision=1,
+        start=utc_iso(stop["start_utc"]),
+        end=utc_iso(stop["end_utc"]),
+        rules_version=stop["rules_version"],
+        cancel_token=stop["cancel_token"],
+        created_at=stop["reservation_created_at"],
+        cancelled_at=stop["cancelled_at"],
+    )
+
+
+def _trip_out(trip: dict, stops: list[dict]) -> TripOut:
+    return TripOut(
+        id=trip["id"],
+        idempotency_key=trip["idempotency_key"],
+        created_at=trip["created_at"],
+        stops=[_trip_stop_out(s) for s in stops],
+    )
+
+
+@app.post("/trips", response_model=TripOut, status_code=201, tags=["trips"])
+def create_trip(body: TripCreateIn, response: Response) -> TripOut:
+    """Book a whole cross-point trip atomically.
+
+    Each stop is validated against its own point's current published
+    calendar with exactly the single-reservation rules (future window,
+    duration, continuous open interval, no overlap).  Either every stop is
+    created in one transaction or none of them is.
+    """
+    # Cross-stop structural checks independent of any database state.
+    seen_points: set[int] = set()
+    parsed_stops: list[tuple[int, datetime, datetime]] = []
+    prev_end: datetime | None = None
+    for index, stop in enumerate(body.stops):
+        start = stop.start.astimezone(timezone.utc)
+        end = stop.end.astimezone(timezone.utc)
+        if stop.point_id in seen_points:
+            raise InvalidRequestError(
+                f"a recycling point may appear only once in a trip; point "
+                f"{stop.point_id} repeats at stop {index}",
+                details={
+                    "stop_index": index,
+                    "point_id": stop.point_id,
+                    "reason": "duplicate_point",
+                },
+            )
+        seen_points.add(stop.point_id)
+        if prev_end is not None and start < prev_end:
+            raise InvalidRequestError(
+                f"trip stops must be ordered by visiting time: stop {index} "
+                f"starts before the previous stop ends",
+                details={
+                    "stop_index": index,
+                    "previous_end": utc_iso(prev_end),
+                    "start": utc_iso(start),
+                    "reason": "stops_not_chronological",
+                },
+            )
+        prev_end = end
+        parsed_stops.append((stop.point_id, start, end))
+
+    now = datetime.now(timezone.utc)
+    with db.conn() as connection:
+        with connection.transaction():
+            cur = connection.cursor()
+
+            # A key-scoped transaction advisory lock serializes retries with
+            # the same trip key before the trip row exists, so concurrent
+            # first requests cannot both book the trip.
+            db.acquire_trip_key_lock(cur, body.idempotency_key)
+            existing_trip = db.get_trip_by_key(cur, body.idempotency_key)
+            if existing_trip is not None:
+                existing_stops = db.get_trip_stops(cur, existing_trip["id"])
+                fingerprint = [(pid, s, e) for pid, s, e in parsed_stops]
+                stored_fingerprint = [
+                    (s["point_id"], s["start_utc"], s["end_utc"])
+                    for s in existing_stops
+                ]
+                if stored_fingerprint == fingerprint:
+                    response.status_code = 200
+                    return _trip_out(existing_trip, existing_stops)
+                raise IdempotencyConflictError(
+                    f"trip idempotency key {body.idempotency_key!r} was already "
+                    f"used with a different ordered set of stops",
+                    details={
+                        "trip_id": existing_trip["id"],
+                        "stops": [
+                            {
+                                "stop_index": s["stop_order"],
+                                "point_id": s["point_id"],
+                                "start": utc_iso(s["start_utc"]),
+                                "end": utc_iso(s["end_utc"]),
+                            }
+                            for s in existing_stops
+                        ],
+                    },
+                )
+
+            # Lock every involved point row in ascending id order — the same
+            # global order used by reassign (the only other path taking more
+            # than one point lock).  Hence trips serialize against
+            # creation/cancel/reschedule/publish/waitlist promotion per point
+            # without deadlock or double occupancy, even under opposite-order
+            # traffic.
+            points: dict[int, dict] = {}
+            point_stop_index: dict[int, int] = {}
+            for index, (pid, _start, _end) in enumerate(parsed_stops):
+                if pid not in point_stop_index:
+                    point_stop_index[pid] = index
+            for pid in sorted(seen_points):
+                try:
+                    points[pid] = db.lock_point(cur, pid)
+                except ApiError as exc:
+                    raise _with_stop(exc, point_stop_index[pid])
+
+            # Validate every stop before inserting anything: window policy,
+            # currently published calendar coverage and per-point occupancy.
+            # Rules/calendar are cached per point (points never repeat).
+            rules_cache: dict[int, dict] = {}
+            ruleset_cache: dict[int, tuple] = {}
+            for index, (pid, start, end) in enumerate(parsed_stops):
+                try:
+                    validate_reservation_window(
+                        start,
+                        end,
+                        now,
+                        max_days_ahead=settings.reservation_max_days_ahead,
+                        max_duration=timedelta(
+                            minutes=settings.reservation_max_duration_minutes
+                        ),
+                    )
+                    if pid not in rules_cache:
+                        _, rules_row = db.get_current_rules(cur, pid)
+                        rules_cache[pid] = rules_row
+                        zone = get_zone(points[pid]["timezone"])
+                        ruleset_cache[pid] = (
+                            zone,
+                            payload_to_ruleset(rules_row["payload"]),
+                        )
+                    rules_row = rules_cache[pid]
+                    zone, ruleset = ruleset_cache[pid]
+                    date_from = (start - timedelta(days=1)).astimezone(zone).date()
+                    date_to = (end + timedelta(days=1)).astimezone(zone).date()
+                    intervals = build_open_intervals(
+                        points[pid]["timezone"], ruleset, date_from, date_to
+                    )
+                    if not any(s <= start and end <= e for s, e in intervals):
+                        raise OutsideOpenHoursError(
+                            "trip stop is not fully contained in one continuous "
+                            "open interval of the point's published calendar",
+                            details={
+                                "start": utc_iso(start),
+                                "end": utc_iso(end),
+                                "rules_version": rules_row["version"],
+                            },
+                        )
+                    overlapping = db.find_overlapping(cur, pid, start, end)
+                    if overlapping:
+                        raise ReservationOverlapError(
+                            "trip stop overlaps an existing active reservation",
+                            details={
+                                "conflicting_reservation_ids": [
+                                    r["id"] for r in overlapping
+                                ]
+                            },
+                        )
+                except ApiError as exc:
+                    raise _with_stop(exc, index)
+
+            # All checks passed: create the trip plus one ordinary
+            # reservation per stop, each with a server-generated creation
+            # key (so trip bookings occupy windows exactly like single
+            # bookings and are cancelable/reschedulable on their own).  Any
+            # failure rolls the whole group back — nothing is persisted.
+            trip = db.insert_trip(cur, body.idempotency_key)
+            for index, (pid, start, end) in enumerate(parsed_stops):
+                reservation = db.insert_reservation(
+                    cur,
+                    pid,
+                    f"__trip__:{trip['id']}:{index}:{secrets.token_urlsafe(16)}",
+                    start,
+                    end,
+                    rules_cache[pid]["version"],
+                )
+                db.insert_trip_stop(
+                    cur, trip["id"], index, pid, reservation["id"]
+                )
+            stops = db.get_trip_stops(cur, trip["id"])
+    return _trip_out(trip, stops)
 
 
 # ---------------------------------------------------------------------------

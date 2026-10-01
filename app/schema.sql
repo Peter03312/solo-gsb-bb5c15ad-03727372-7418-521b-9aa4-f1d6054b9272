@@ -149,3 +149,36 @@ CREATE INDEX IF NOT EXISTS idx_waitlist_point_waiting
 
 CREATE INDEX IF NOT EXISTS idx_waitlist_point_reservation
     ON waitlist_entries (point_id, reservation_id);
+
+-- Multi-stop trips (跨回收点行程).  A trip books 2..5 reservations at distinct
+-- recycling points in one transaction; all stops are created or none are.
+-- The idempotency key is a global (trip-level) client scope: the first
+-- successful request wins, same-content retries replay its stops in input
+-- order, different content conflicts.  The fingerprint of the request is the
+-- ordered (point_id, start_utc, end_utc) sequence, reconstructed from
+-- trip_stops joined to the reservations' immutable creation snapshot.
+CREATE TABLE IF NOT EXISTS trips (
+    id              BIGSERIAL PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- One row per stop of a booked trip, in request order (``stop_order`` is
+-- 0-based).  Each stop points at the ordinary reservation created for it;
+-- that reservation is cancelled/rescheduled/reassigned through the existing
+-- single-reservation endpoints without affecting this linkage.
+CREATE TABLE IF NOT EXISTS trip_stops (
+    id             BIGSERIAL PRIMARY KEY,
+    trip_id        BIGINT NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
+    stop_order     INTEGER NOT NULL,
+    point_id       BIGINT NOT NULL REFERENCES points(id),
+    reservation_id BIGINT NOT NULL REFERENCES reservations(id),
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (trip_id, stop_order)
+);
+
+CREATE INDEX IF NOT EXISTS idx_trip_stops_trip
+    ON trip_stops (trip_id, stop_order);
+
+CREATE INDEX IF NOT EXISTS idx_trip_stops_reservation
+    ON trip_stops (reservation_id);

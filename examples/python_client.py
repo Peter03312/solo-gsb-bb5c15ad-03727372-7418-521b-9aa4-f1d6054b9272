@@ -424,6 +424,85 @@ def main() -> None:
     )
     show("the new reservation cancels with its own token", status, cancelled_new)
 
+    # ------------------------------------------------------------------
+    # Trips (跨回收点行程): atomically book 2..5 stops in visiting order.
+    # ------------------------------------------------------------------
+    trip_pids = []
+    for name in ("行程点甲", "行程点乙", "行程点丙"):
+        _, point = call("POST", "/points", {"name": name, "timezone": "UTC"})
+        pid = point["id"]
+        call(
+            "POST",
+            f"/points/{pid}/rules",
+            {
+                "expected_version": 0,
+                "rules": {
+                    "weekly": [
+                        {"weekday": weekday, "start_time": "08:00", "end_time": "12:00"}
+                    ],
+                    "closed_dates": [],
+                    "makeup": [],
+                },
+            },
+        )
+        trip_pids.append(pid)
+
+    trip_body = {
+        "idempotency_key": "trip-demo-1",
+        "stops": [
+            {"point_id": trip_pids[0],
+             "start": f"{tomorrow}T09:00:00Z", "end": f"{tomorrow}T09:30:00Z"},
+            {"point_id": trip_pids[1],
+             "start": f"{tomorrow}T10:00:00Z", "end": f"{tomorrow}T10:30:00Z"},
+            {"point_id": trip_pids[2],
+             "start": f"{tomorrow}T11:00:00Z", "end": f"{tomorrow}T11:30:00Z"},
+        ],
+    }
+    status, booked_trip = call("POST", "/trips", trip_body)
+    show("book a whole 3-stop trip atomically", status, booked_trip)
+
+    status, replayed_trip = call("POST", "/trips", trip_body)
+    show("same trip key + same ordered stops replays the first snapshot", status, replayed_trip)
+
+    status, trip_conflict = call(
+        "POST",
+        "/trips",
+        {
+            "idempotency_key": "trip-demo-1",
+            "stops": [
+                {"point_id": trip_pids[0],
+                 "start": f"{tomorrow}T09:00:00Z", "end": f"{tomorrow}T09:30:00Z"},
+                {"point_id": trip_pids[1],
+                 "start": f"{tomorrow}T10:15:00Z", "end": f"{tomorrow}T10:45:00Z"},
+            ],
+        },
+    )
+    show("same trip key + different content conflicts", status, trip_conflict)
+
+    status, dup = call(
+        "POST",
+        "/trips",
+        {
+            "idempotency_key": "trip-demo-bad-points",
+            "stops": [
+                {"point_id": trip_pids[0],
+                 "start": f"{tomorrow}T09:00:00Z", "end": f"{tomorrow}T09:30:00Z"},
+                {"point_id": trip_pids[0],
+                 "start": f"{tomorrow}T10:00:00Z", "end": f"{tomorrow}T10:30:00Z"},
+            ],
+        },
+    )
+    show("a repeated point is rejected (422 invalid_request)", status, dup)
+
+    # Each stop is a normal reservation: cancel one with its own token.
+    stop0 = booked_trip["stops"][0]
+    status, stop_cancelled = call(
+        "POST",
+        f"/points/{stop0['point_id']}/reservations/{stop0['id']}/cancel",
+        {"cancel_token": stop0["cancel_token"]},
+    )
+    show("cancel one trip stop with its own cancel token", status, stop_cancelled)
+
 
 if __name__ == "__main__":
     main()

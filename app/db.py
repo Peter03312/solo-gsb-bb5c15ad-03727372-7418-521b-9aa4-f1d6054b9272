@@ -774,3 +774,76 @@ def promote_waitlist(
         ).fetchone()
         break
     return promoted
+
+
+# ---------------------------------------------------------------------------
+# Multi-stop trips (跨回收点行程)
+# ---------------------------------------------------------------------------
+
+_TRIP_COLS = "id, idempotency_key, created_at"
+
+_TRIP_STOP_COLS = (
+    "ts.stop_order AS stop_order, ts.point_id AS point_id, "
+    "r.id AS reservation_id, r.status AS status, r.revision AS revision, "
+    "r.cancel_token AS cancel_token, r.created_at AS reservation_created_at, "
+    "r.cancelled_at AS cancelled_at, r.created_start_utc AS start_utc, "
+    "r.created_end_utc AS end_utc, r.created_rules_version AS rules_version"
+)
+
+
+def acquire_trip_key_lock(cur: psycopg.Cursor, idempotency_key: str) -> None:
+    """Take a transaction-scoped advisory lock for one trip idempotency key.
+
+    Two concurrent requests carrying the same trip key therefore serialize
+    even before either ``trips`` row exists, which keeps the "first request
+    wins" semantics race-free without relying on a unique-violation retry.
+    """
+    cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+        (f"trip-key:{idempotency_key}",),
+    )
+
+
+def get_trip_by_key(cur: psycopg.Cursor, idempotency_key: str) -> dict | None:
+    return cur.execute(
+        f"SELECT {_TRIP_COLS} FROM trips WHERE idempotency_key = %s",
+        (idempotency_key,),
+    ).fetchone()
+
+
+def get_trip_stops(cur: psycopg.Cursor, trip_id: int) -> list[dict]:
+    """All stops of a trip in request (input) order.
+
+    The window / rules version come from the reservation's immutable
+    creation snapshot, so a replay always reports the first-created content
+    even after a later reschedule or cancellation; status fields track the
+    live reservation row instead.
+    """
+    return cur.execute(
+        f"SELECT {_TRIP_STOP_COLS} "
+        "FROM trip_stops ts JOIN reservations r ON r.id = ts.reservation_id "
+        "WHERE ts.trip_id = %s ORDER BY ts.stop_order",
+        (trip_id,),
+    ).fetchall()
+
+
+def insert_trip(cur: psycopg.Cursor, idempotency_key: str) -> dict:
+    return cur.execute(
+        f"INSERT INTO trips (idempotency_key) VALUES (%s) "
+        f"RETURNING {_TRIP_COLS}",
+        (idempotency_key,),
+    ).fetchone()
+
+
+def insert_trip_stop(
+    cur: psycopg.Cursor,
+    trip_id: int,
+    stop_order: int,
+    point_id: int,
+    reservation_id: int,
+) -> None:
+    cur.execute(
+        "INSERT INTO trip_stops (trip_id, stop_order, point_id, reservation_id) "
+        "VALUES (%s, %s, %s, %s)",
+        (trip_id, stop_order, point_id, reservation_id),
+    )

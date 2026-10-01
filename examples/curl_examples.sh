@@ -377,3 +377,78 @@ api POST "/points/$RPID/reservations/$SRC_ID/reassign" "{
 echo
 echo "-- the new reservation at the target point cancels with its own token (200) --"
 api POST "/points/$TPID/reservations/$NEW_ID/cancel" "{\"cancel_token\":\"$NEW_TOKEN\"}"
+
+echo
+echo "== 10. Trips (跨回收点行程): book several stops in one request =="
+# Three points, each with a published rule covering tomorrow ($D1, weekday $WD).
+TRIP_PIDS=()
+for name in 行程点甲 行程点乙 行程点丙; do
+  TJ="$(api POST /points "{\"name\":\"$name\",\"timezone\":\"UTC\"}")"
+  TJPID="$(echo "$TJ" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+  api POST "/points/$TJPID/rules" "{
+    \"expected_version\": 0,
+    \"rules\": {
+      \"weekly\": [{\"weekday\": $WD, \"start_time\": \"08:00\", \"end_time\": \"12:00\"}],
+      \"closed_dates\": [],
+      \"makeup\": []
+    }
+  }" >/dev/null
+  TRIP_PIDS+=("$TJPID")
+done
+
+echo
+echo "-- book a 3-stop trip atomically (201; stops ordered by visiting time) --"
+TRIP_BODY="{
+  \"idempotency_key\": \"demo-trip-1\",
+  \"stops\": [
+    {\"point_id\": ${TRIP_PIDS[0]}, \"start\": \"${D1}T09:00:00Z\", \"end\": \"${D1}T09:30:00Z\"},
+    {\"point_id\": ${TRIP_PIDS[1]}, \"start\": \"${D1}T10:00:00Z\", \"end\": \"${D1}T10:30:00Z\"},
+    {\"point_id\": ${TRIP_PIDS[2]}, \"start\": \"${D1}T11:00:00Z\", \"end\": \"${D1}T11:30:00Z\"}
+  ]
+}"
+TRIP_JSON="$(api POST /trips "$TRIP_BODY")"
+echo "$TRIP_JSON"
+
+echo
+echo "-- same trip key + same ordered stops replay the first snapshot (200) --"
+api POST /trips "$TRIP_BODY"
+
+echo
+echo "-- same trip key + different content conflicts (409 idempotency_conflict) --"
+api POST /trips "{
+  \"idempotency_key\": \"demo-trip-1\",
+  \"stops\": [
+    {\"point_id\": ${TRIP_PIDS[0]}, \"start\": \"${D1}T09:00:00Z\", \"end\": \"${D1}T09:30:00Z\"},
+    {\"point_id\": ${TRIP_PIDS[1]}, \"start\": \"${D1}T10:15:00Z\", \"end\": \"${D1}T10:45:00Z\"}
+  ]
+}"
+
+echo
+echo "-- a repeated point is rejected (422 invalid_request, with stop_index) --"
+api POST /trips "{
+  \"idempotency_key\": \"demo-trip-bad-points\",
+  \"stops\": [
+    {\"point_id\": ${TRIP_PIDS[0]}, \"start\": \"${D1}T09:00:00Z\", \"end\": \"${D1}T09:30:00Z\"},
+    {\"point_id\": ${TRIP_PIDS[0]}, \"start\": \"${D1}T10:00:00Z\", \"end\": \"${D1}T10:30:00Z\"}
+  ]
+}"
+
+echo
+echo "-- stops out of visiting order are rejected (422 invalid_request) --"
+api POST /trips "{
+  \"idempotency_key\": \"demo-trip-bad-order\",
+  \"stops\": [
+    {\"point_id\": ${TRIP_PIDS[0]}, \"start\": \"${D1}T10:00:00Z\", \"end\": \"${D1}T11:00:00Z\"},
+    {\"point_id\": ${TRIP_PIDS[1]}, \"start\": \"${D1}T10:30:00Z\", \"end\": \"${D1}T10:45:00Z\"}
+  ]
+}"
+
+echo
+echo "-- one stop outside open hours fails the whole group (409, nothing booked) --"
+api POST /trips "{
+  \"idempotency_key\": \"demo-trip-outside\",
+  \"stops\": [
+    {\"point_id\": ${TRIP_PIDS[0]}, \"start\": \"${D1}T09:00:00Z\", \"end\": \"${D1}T09:30:00Z\"},
+    {\"point_id\": ${TRIP_PIDS[1]}, \"start\": \"${D1}T13:00:00Z\", \"end\": \"${D1}T13:30:00Z\"}
+  ]
+}"

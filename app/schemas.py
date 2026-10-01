@@ -155,6 +155,31 @@ class ReservationReassignIn(BaseModel):
         return value
 
 
+class TripStopIn(BaseModel):
+    """One stop of a multi-stop trip (跨回收点行程)."""
+
+    point_id: int = Field(ge=1)
+    start: datetime
+    end: datetime
+
+    @field_validator("start", "end")
+    @classmethod
+    def _must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(
+                "must be an ISO-8601 timestamp with an explicit UTC offset "
+                "(e.g. 2026-10-01T09:00:00Z)"
+            )
+        return value
+
+
+class TripCreateIn(BaseModel):
+    """Book a whole cross-point trip: 2..5 ordered stops in one request."""
+
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    stops: list[TripStopIn] = Field(min_length=2, max_length=5)
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -406,3 +431,34 @@ class ReassignOut(BaseModel):
     source_reservation: ReservationStateOut
     target_reservation: ReservationOut
     target_rules_version: int
+
+
+class TripStopOut(BaseModel):
+    """One booked stop of a multi-stop trip, reported in request order.
+
+    The window / rules version are the stop's first-creation snapshot (a
+    replay keeps reporting them even if the reservation is later rescheduled
+    or cancelled); ``status`` / ``cancelled_at`` reflect the live
+    reservation.  ``revision`` is always 1 for the creation snapshot.
+    """
+
+    index: int
+    point_id: int
+    id: int
+    status: str
+    revision: int
+    start: str
+    end: str
+    rules_version: int
+    cancel_token: str
+    created_at: datetime
+    cancelled_at: datetime | None
+
+
+class TripOut(BaseModel):
+    """Result of booking (or replaying) one whole cross-point trip."""
+
+    id: int
+    idempotency_key: str
+    created_at: datetime
+    stops: list[TripStopOut]
