@@ -377,3 +377,101 @@ api POST "/points/$RPID/reservations/$SRC_ID/reassign" "{
 echo
 echo "-- the new reservation at the target point cancels with its own token (200) --"
 api POST "/points/$TPID/reservations/$NEW_ID/cancel" "{\"cancel_token\":\"$NEW_TOKEN\"}"
+
+echo
+echo "== 10. Trips (行程): book a multi-stop visit across points atomically =="
+# Two fresh points, each open 08:00-12:00 tomorrow (UTC).
+APOINT_JSON="$(api POST /points '{"name":"行程演示点A","timezone":"UTC"}')"
+echo "$APOINT_JSON"
+APID="$(echo "$APOINT_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+api POST "/points/$APID/rules" "{
+  \"expected_version\": 0,
+  \"rules\": {
+    \"weekly\": [{\"weekday\": $WD, \"start_time\": \"08:00\", \"end_time\": \"12:00\"}],
+    \"closed_dates\": [],
+    \"makeup\": []
+  }
+}"
+BPOINT_JSON="$(api POST /points '{"name":"行程演示点B","timezone":"UTC"}')"
+echo "$BPOINT_JSON"
+BPID="$(echo "$BPOINT_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+api POST "/points/$BPID/rules" "{
+  \"expected_version\": 0,
+  \"rules\": {
+    \"weekly\": [{\"weekday\": $WD, \"start_time\": \"08:00\", \"end_time\": \"12:00\"}],
+    \"closed_dates\": [],
+    \"makeup\": []
+  }
+}"
+
+echo
+echo "-- book a two-stop trip as one group (201; per-stop number + cancel token) --"
+TRIP_BODY="{
+  \"idempotency_key\": \"trip-demo-1-$APID\",
+  \"stops\": [
+    {\"point_id\": $APID, \"start\": \"${D1}T09:00:00Z\", \"end\": \"${D1}T09:30:00Z\"},
+    {\"point_id\": $BPID, \"start\": \"${D1}T10:00:00Z\", \"end\": \"${D1}T10:30:00Z\"}
+  ]
+}"
+TRIP_JSON="$(api POST /trips "$TRIP_BODY")"
+echo "$TRIP_JSON"
+# First stop's reservation number and cancel token (nested JSON: first match).
+TRIP_RID="$(echo "$TRIP_JSON" | grep -o '"reservation":{"id":[0-9]*' | head -1 | grep -o '[0-9]*$')"
+TRIP_TOKEN="$(echo "$TRIP_JSON" | grep -o '"cancel_token":"[^"]*"' | head -1 | cut -d'"' -f4)"
+
+echo
+echo "-- same trip key + same ordered content replays the first snapshot (200) --"
+api POST /trips "$TRIP_BODY"
+
+echo
+echo "-- same trip key + different content conflicts (409 idempotency_conflict) --"
+api POST /trips "{
+  \"idempotency_key\": \"trip-demo-1-$APID\",
+  \"stops\": [
+    {\"point_id\": $APID, \"start\": \"${D1}T09:00:00Z\", \"end\": \"${D1}T09:30:00Z\"},
+    {\"point_id\": $BPID, \"start\": \"${D1}T10:30:00Z\", \"end\": \"${D1}T11:00:00Z\"}
+  ]
+}"
+
+echo
+echo "-- one stop outside its calendar: the whole group fails, stop is named (409) --"
+api POST /trips "{
+  \"idempotency_key\": \"trip-demo-2-$APID\",
+  \"stops\": [
+    {\"point_id\": $APID, \"start\": \"${D1}T11:00:00Z\", \"end\": \"${D1}T11:30:00Z\"},
+    {\"point_id\": $BPID, \"start\": \"${D1}T13:00:00Z\", \"end\": \"${D1}T13:30:00Z\"}
+  ]
+}"
+
+echo
+echo "-- nothing was stored: the first stop's window is still free (201) --"
+api POST "/points/$APID/reservations" "{
+  \"idempotency_key\": \"trip-demo-proof\",
+  \"start\": \"${D1}T11:00:00Z\",
+  \"end\": \"${D1}T11:30:00Z\"
+}"
+
+echo
+echo "-- repeated point in one trip (422 invalid_request) --"
+api POST /trips "{
+  \"idempotency_key\": \"trip-demo-3-$APID\",
+  \"stops\": [
+    {\"point_id\": $APID, \"start\": \"${D1}T08:00:00Z\", \"end\": \"${D1}T08:30:00Z\"},
+    {\"point_id\": $APID, \"start\": \"${D1}T08:30:00Z\", \"end\": \"${D1}T09:00:00Z\"}
+  ]
+}"
+
+echo
+echo "-- stops out of visit order (422 invalid_period) --"
+api POST /trips "{
+  \"idempotency_key\": \"trip-demo-4-$APID\",
+  \"stops\": [
+    {\"point_id\": $APID, \"start\": \"${D1}T08:00:00Z\", \"end\": \"${D1}T09:00:00Z\"},
+    {\"point_id\": $BPID, \"start\": \"${D1}T08:30:00Z\", \"end\": \"${D1}T09:30:00Z\"}
+  ]
+}"
+
+echo
+echo "-- cancel one stop with its own token (200); the group replay still works --"
+api POST "/points/$APID/reservations/$TRIP_RID/cancel" "{\"cancel_token\":\"$TRIP_TOKEN\"}"
+api POST /trips "$TRIP_BODY"

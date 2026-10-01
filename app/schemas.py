@@ -155,6 +155,36 @@ class ReservationReassignIn(BaseModel):
         return value
 
 
+class TripStopIn(BaseModel):
+    """One stop of a trip: a recycling point plus a timezone-aware window."""
+
+    point_id: int = Field(ge=1)
+    start: datetime
+    end: datetime
+
+    @field_validator("start", "end")
+    @classmethod
+    def _must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(
+                "must be an ISO-8601 timestamp with an explicit UTC offset "
+                "(e.g. 2026-10-01T09:00:00Z)"
+            )
+        return value
+
+
+class TripCreateIn(BaseModel):
+    """Trip (行程) booking request: one idempotency key + 2..5 ordered stops.
+
+    Stops are given in visit order; each stop's window is validated with the
+    same rules as a single reservation, and the whole group is booked
+    atomically.
+    """
+
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    stops: list[TripStopIn] = Field(min_length=2, max_length=5)
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -406,3 +436,23 @@ class ReassignOut(BaseModel):
     source_reservation: ReservationStateOut
     target_reservation: ReservationOut
     target_rules_version: int
+
+
+class TripStopOut(BaseModel):
+    """One booked stop of a trip, in submitted visit order."""
+
+    point_id: int
+    reservation: ReservationOut
+
+
+class TripOut(BaseModel):
+    """Result of an atomic multi-stop trip booking (行程).
+
+    ``stops`` is always in the submitted visit order; each entry carries the
+    reservation number, cancel token, window and rules version of that stop.
+    """
+
+    trip_id: int
+    idempotency_key: str
+    created_at: datetime
+    stops: list[TripStopOut]

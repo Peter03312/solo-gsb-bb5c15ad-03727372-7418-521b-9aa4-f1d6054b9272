@@ -424,6 +424,150 @@ def main() -> None:
     )
     show("the new reservation cancels with its own token", status, cancelled_new)
 
+    # ------------------------------------------------------------------
+    # Trips (行程): book a multi-stop visit across points atomically.
+    # A second point with its own published calendar hosts the first stop.
+    # ------------------------------------------------------------------
+    status, trip_point = call(
+        "POST", "/points", {"name": "行程演示点", "timezone": "UTC"}
+    )
+    qpid = trip_point["id"]
+    status, published = call(
+        "POST",
+        f"/points/{qpid}/rules",
+        {
+            "expected_version": 0,
+            "rules": {
+                "weekly": [
+                    {"weekday": weekday, "start_time": "08:00", "end_time": "12:00"}
+                ],
+                "closed_dates": [],
+                "makeup": [],
+            },
+        },
+    )
+    show("create + publish a second point for the trip", status, published)
+
+    trip_body = {
+        # Trip keys are one global scope (not per point); suffix with the
+        # fresh point id so this walkthrough can be re-run on the same DB.
+        "idempotency_key": f"trip-demo-1-{qpid}",
+        "stops": [
+            {
+                "point_id": qpid,
+                "start": f"{tomorrow}T09:00:00Z",
+                "end": f"{tomorrow}T09:30:00Z",
+            },
+            {
+                "point_id": rpid,
+                "start": f"{tomorrow}T11:00:00Z",
+                "end": f"{tomorrow}T11:30:00Z",
+            },
+        ],
+    }
+    status, trip = call("POST", "/trips", trip_body)
+    show(
+        "book a two-stop trip as one group (per-stop number + cancel token)",
+        status,
+        trip,
+    )
+    first_stop = trip["stops"][0]["reservation"]
+
+    status, trip_replay = call("POST", "/trips", trip_body)
+    show("same trip key + same ordered content replays (200)", status, trip_replay)
+
+    status, trip_conflict = call(
+        "POST",
+        "/trips",
+        {
+            "idempotency_key": f"trip-demo-1-{qpid}",
+            "stops": [
+                {
+                    "point_id": qpid,
+                    "start": f"{tomorrow}T09:00:00Z",
+                    "end": f"{tomorrow}T09:30:00Z",
+                },
+                {
+                    "point_id": rpid,
+                    "start": f"{tomorrow}T11:30:00Z",
+                    "end": f"{tomorrow}T12:00:00Z",
+                },
+            ],
+        },
+    )
+    show("same trip key + different content conflicts", status, trip_conflict)
+
+    status, broken = call(
+        "POST",
+        "/trips",
+        {
+            "idempotency_key": f"trip-demo-2-{qpid}",
+            "stops": [
+                {
+                    "point_id": qpid,
+                    "start": f"{tomorrow}T10:00:00Z",
+                    "end": f"{tomorrow}T10:30:00Z",
+                },
+                {
+                    "point_id": rpid,
+                    "start": f"{tomorrow}T13:00:00Z",
+                    "end": f"{tomorrow}T13:30:00Z",
+                },
+            ],
+        },
+    )
+    show(
+        "one stop outside its calendar: group fails, failing stop is named",
+        status,
+        broken,
+    )
+
+    status, proof = call(
+        "POST",
+        f"/points/{qpid}/reservations",
+        {
+            "idempotency_key": "trip-demo-proof",
+            "start": f"{tomorrow}T10:00:00Z",
+            "end": f"{tomorrow}T10:30:00Z",
+        },
+    )
+    show("nothing was stored: the first stop's window is still free", status, proof)
+
+    status, repeated = call(
+        "POST",
+        "/trips",
+        {
+            "idempotency_key": f"trip-demo-3-{qpid}",
+            "stops": [
+                {
+                    "point_id": qpid,
+                    "start": f"{tomorrow}T08:00:00Z",
+                    "end": f"{tomorrow}T08:30:00Z",
+                },
+                {
+                    "point_id": qpid,
+                    "start": f"{tomorrow}T08:30:00Z",
+                    "end": f"{tomorrow}T09:00:00Z",
+                },
+            ],
+        },
+    )
+    show("a repeated point in one trip is rejected", status, repeated)
+
+    status, cancelled_stop = call(
+        "POST",
+        f"/points/{qpid}/reservations/{first_stop['id']}/cancel",
+        {"cancel_token": first_stop["cancel_token"]},
+    )
+    show("cancel one stop with its own token", status, cancelled_stop)
+
+    status, after_cancel = call("POST", "/trips", trip_body)
+    show(
+        "group replay still returns the first snapshot (stop now cancelled)",
+        status,
+        after_cancel,
+    )
+
 
 if __name__ == "__main__":
     main()

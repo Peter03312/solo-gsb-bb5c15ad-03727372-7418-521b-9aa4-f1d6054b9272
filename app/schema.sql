@@ -149,3 +149,37 @@ CREATE INDEX IF NOT EXISTS idx_waitlist_point_waiting
 
 CREATE INDEX IF NOT EXISTS idx_waitlist_point_reservation
     ON waitlist_entries (point_id, reservation_id);
+
+-- Trips (跨回收点行程整体预约).  A trip is a group of 2..5 stops at distinct
+-- recycling points, booked atomically: either every stop validates and is
+-- booked in one transaction, or nothing is stored at all.  The trip-level
+-- idempotency key is one global scope for the whole itinerary: the first
+-- successful request wins, a retry with the same ordered stop content
+-- replays the first-creation snapshot, different content conflicts.
+CREATE TABLE IF NOT EXISTS trips (
+    id              BIGSERIAL PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,      -- global trip idempotency scope
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- One row per stop of a successfully booked trip, in submitted visit order
+-- (position is the 0-based index into the request's stops array).  The
+-- requested window and the rules version validated against are stored so a
+-- retry can be compared against the complete ordered content and the
+-- first-creation snapshot can be replayed even after individual stops are
+-- rescheduled or cancelled.
+CREATE TABLE IF NOT EXISTS trip_stops (
+    id              BIGSERIAL PRIMARY KEY,
+    trip_id         BIGINT NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
+    position        INTEGER NOT NULL,          -- 0-based index in the request
+    point_id        BIGINT NOT NULL REFERENCES points(id) ON DELETE CASCADE,
+    reservation_id  BIGINT NOT NULL REFERENCES reservations(id) ON DELETE CASCADE,
+    start_utc       TIMESTAMPTZ NOT NULL,      -- requested window (idempotency content)
+    end_utc         TIMESTAMPTZ NOT NULL,
+    rules_version   INTEGER NOT NULL,          -- published version validated against
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (trip_id, position)
+);
+
+CREATE INDEX IF NOT EXISTS idx_trip_stops_reservation
+    ON trip_stops (reservation_id);

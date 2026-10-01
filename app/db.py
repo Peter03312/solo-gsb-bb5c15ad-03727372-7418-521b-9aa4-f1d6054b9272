@@ -774,3 +774,77 @@ def promote_waitlist(
         ).fetchone()
         break
     return promoted
+
+
+# ---------------------------------------------------------------------------
+# Trips (跨回收点行程) — atomic multi-stop bookings
+# ---------------------------------------------------------------------------
+
+_TRIP_COLS = "id, idempotency_key, created_at"
+
+_TRIP_STOP_COLS = (
+    "id, trip_id, position, point_id, reservation_id, start_utc, end_utc, "
+    "rules_version, created_at"
+)
+
+
+def insert_trip_key(cur: psycopg.Cursor, idempotency_key: str) -> dict | None:
+    """Claim a trip idempotency key inside the caller's transaction.
+
+    Returns the new trip row, or None when the key is already committed.
+    A concurrent in-flight insert of the same key blocks until that
+    transaction resolves, so same-key requests serialize here; a rolled-back
+    attempt leaves no row, so a failed trip never consumes its key.
+    """
+    return cur.execute(
+        "INSERT INTO trips (idempotency_key) VALUES (%s) "
+        "ON CONFLICT (idempotency_key) DO NOTHING "
+        f"RETURNING {_TRIP_COLS}",
+        (idempotency_key,),
+    ).fetchone()
+
+
+def get_trip_by_key(cur: psycopg.Cursor, idempotency_key: str) -> dict | None:
+    return cur.execute(
+        f"SELECT {_TRIP_COLS} FROM trips WHERE idempotency_key = %s",
+        (idempotency_key,),
+    ).fetchone()
+
+
+def get_trip_stops(cur: psycopg.Cursor, trip_id: int) -> list[dict]:
+    """Stops of one trip in submitted visit order (position ascending)."""
+    return cur.execute(
+        f"SELECT {_TRIP_STOP_COLS} FROM trip_stops "
+        "WHERE trip_id = %s ORDER BY position",
+        (trip_id,),
+    ).fetchall()
+
+
+def insert_trip_stop(
+    cur: psycopg.Cursor,
+    *,
+    trip_id: int,
+    position: int,
+    point_id: int,
+    reservation_id: int,
+    start_utc: datetime,
+    end_utc: datetime,
+    rules_version: int,
+) -> dict:
+    """Record one booked stop of a trip (same transaction as the trip row)."""
+    return cur.execute(
+        "INSERT INTO trip_stops "
+        "(trip_id, position, point_id, reservation_id, start_utc, end_utc, "
+        " rules_version) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+        f"RETURNING {_TRIP_STOP_COLS}",
+        (
+            trip_id,
+            position,
+            point_id,
+            reservation_id,
+            start_utc,
+            end_utc,
+            rules_version,
+        ),
+    ).fetchone()
